@@ -1,8 +1,8 @@
-Flask
-pandas
-numpy
-scikit-learn
-joblib
-matplotlib
-reportlab
-gunicorn
+Flask==3.0.3
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.1
+joblib==1.4.2
+reportlab==4.2.2
+Werkzeug==3.0.3
+gunicorn==22.0.0
