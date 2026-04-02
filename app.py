@@ -2,7 +2,6 @@ import io
 import os
 import sqlite3
 import time
-import threading
 from functools import wraps
 
 import pandas as pd
@@ -12,16 +11,14 @@ from reportlab.pdfgen import canvas
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from utils.predictor import predict_from_file, predict_dataframe
-from sniffer import start_sniffing
-from live_features import build_live_feature_row
 
 app = Flask(__name__)
-app.secret_key = "ai_sentinel_secret"
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "ai_sentinel_secret")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-OUTPUT_FOLDER = os.path.join(BASE_DIR, "outputs")
-INSTANCE_FOLDER = os.path.join(BASE_DIR, "instance")
+UPLOAD_FOLDER = os.path.join("/tmp", "uploads")
+OUTPUT_FOLDER = os.path.join("/tmp", "outputs")
+INSTANCE_FOLDER = os.path.join("/tmp", "instance")
 DB_PATH = os.path.join(INSTANCE_FOLDER, "users.db")
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -63,16 +60,6 @@ def init_db():
 
 
 init_db()
-
-
-# =========================
-# START MOBILE TRAFFIC SNIFFER
-# =========================
-threading.Thread(
-    target=start_sniffing,
-    kwargs={"interface": "Wi-Fi"},   # change if needed
-    daemon=True
-).start()
 
 
 # =========================
@@ -119,7 +106,13 @@ def build_alerts(df):
             "severity": "low",
             "x": 50,
             "y": 50,
-            "place": "Core Zone"
+            "place": "Core Zone",
+            "src_ip": "-",
+            "dst_ip": "-",
+            "dst_port": "-",
+            "protocol": "-",
+            "count": 0,
+            "confidence": 0
         }]
 
     threat_df = df[df["threat_status"] == "Threat"].copy()
@@ -131,20 +124,45 @@ def build_alerts(df):
             "severity": "low",
             "x": 50,
             "y": 50,
-            "place": "Core Zone"
+            "place": "Core Zone",
+            "src_ip": "-",
+            "dst_ip": "-",
+            "dst_port": "-",
+            "protocol": "-",
+            "count": 0,
+            "confidence": 0
         }]
+
+    default_values = {
+        "src_ip": "unknown",
+        "dst_ip": "unknown",
+        "dst_port": 0,
+        "protocol_type": "unknown",
+        "count": 0,
+        "confidence": 0,
+        "predicted_class": "unknown"
+    }
+
+    for col, default_val in default_values.items():
+        if col not in threat_df.columns:
+            threat_df[col] = default_val
 
     grouped = (
         threat_df.groupby("predicted_class")
         .agg(
-            count=("predicted_class", "size"),
-            peak_confidence=("confidence", "max")
+            alert_count=("predicted_class", "size"),
+            peak_confidence=("confidence", "max"),
+            top_src_ip=("src_ip", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+            top_dst_ip=("dst_ip", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+            top_dst_port=("dst_port", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+            top_protocol=("protocol_type", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+            max_count=("count", "max")
         )
         .reset_index()
         .sort_values(by="peak_confidence", ascending=False)
     )
 
-    fake_places = [
+    visual_places = [
         ("North Gateway", 18, 18),
         ("East Node", 78, 25),
         ("South Cluster", 68, 78),
@@ -159,8 +177,13 @@ def build_alerts(df):
 
     for i, row in enumerate(grouped.head(8).itertuples(index=False)):
         attack_name = str(row.predicted_class)
-        count = int(row.count)
+        total_hits = int(row.alert_count)
         score = float(row.peak_confidence)
+        src_ip = str(row.top_src_ip)
+        dst_ip = str(row.top_dst_ip)
+        dst_port = row.top_dst_port
+        protocol = str(row.top_protocol).upper()
+        packet_count = int(row.max_count)
 
         if score >= 90:
             severity = "high"
@@ -169,15 +192,28 @@ def build_alerts(df):
         else:
             severity = "low"
 
-        place, x, y = fake_places[i % len(fake_places)]
+        place, x, y = visual_places[i % len(visual_places)]
+
+        message = (
+            f"Source: {src_ip} → Destination: {dst_ip} | "
+            f"Protocol: {protocol} | Port: {dst_port} | "
+            f"Packets: {packet_count} | Alerts: {total_hits} | "
+            f"Confidence: {score:.2f}%"
+        )
 
         alerts.append({
             "title": f"{attack_name} detected",
-            "message": f"Location: {place} | Count: {count} | Peak Confidence: {score:.2f}%",
+            "message": message,
             "severity": severity,
             "x": x,
             "y": y,
-            "place": place
+            "place": place,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "dst_port": dst_port,
+            "protocol": protocol,
+            "count": packet_count,
+            "confidence": round(score, 2)
         })
 
     return alerts
@@ -435,9 +471,8 @@ def api_live_predict():
 
         if chunk_df.empty:
             LIVE_STATE["cursor"] = 0
-            start = 0
+            chunk_df = df.iloc[0:chunk_size].copy()
             end = chunk_size
-            chunk_df = df.iloc[start:end].copy()
 
         LIVE_STATE["cursor"] = end
 
@@ -448,10 +483,7 @@ def api_live_predict():
         total_safe = int((full_result_df["threat_status"] == "Normal").sum())
 
         threat_df = full_result_df[full_result_df["threat_status"] == "Threat"]
-        top_attack = (
-            threat_df["predicted_class"].value_counts().idxmax()
-            if not threat_df.empty else "normal"
-        )
+        top_attack = threat_df["predicted_class"].value_counts().idxmax() if not threat_df.empty else "normal"
 
         alerts = build_alerts(full_result_df)
         rows = display_result_df.head(10).to_dict(orient="records")
@@ -488,140 +520,75 @@ def api_live_predict():
 @app.route("/api/mobile-live")
 @login_required
 def api_mobile_live():
+    """
+    Vercel-safe version:
+    Uses uploaded dataset chunks only.
+    No Scapy sniffing, no background packet capture.
+    """
     try:
-        live_df, sniffer_error = build_live_feature_row()
-
-        # =========================
-        # REAL PACKET MODE
-        # =========================
-        if not sniffer_error and not live_df.empty:
-            live_df = live_df.copy()
-
-            # DEMO ATTACK MODE
-            if SIMULATION_STATE["attack_mode"]:
-                if "src_bytes" in live_df.columns:
-                    live_df["src_bytes"] = live_df["src_bytes"] * 15
-                if "dst_bytes" in live_df.columns:
-                    live_df["dst_bytes"] = live_df["dst_bytes"] * 12
-                if "count" in live_df.columns:
-                    live_df["count"] = live_df["count"] + 20
-                if "srv_count" in live_df.columns:
-                    live_df["srv_count"] = live_df["srv_count"] + 15
-                if "tcp_count" in live_df.columns:
-                    live_df["tcp_count"] = live_df["tcp_count"] + 10
-
-            full_result_df, display_result_df = predict_dataframe(live_df)
-
-            # Force visible attack output for demo mode
-            if SIMULATION_STATE["attack_mode"] and not full_result_df.empty:
-                full_result_df = full_result_df.copy()
-                display_result_df = display_result_df.copy()
-
-                full_result_df["predicted_class"] = "dos"
-                full_result_df["confidence"] = 96.45
-                full_result_df["threat_status"] = "Threat"
-
-                display_result_df["predicted_class"] = "dos"
-                display_result_df["confidence"] = 96.45
-                display_result_df["threat_status"] = "Threat"
-
-            total_logs = len(full_result_df)
-            total_threats = int((full_result_df["threat_status"] == "Threat").sum())
-            total_safe = int((full_result_df["threat_status"] == "Normal").sum())
-
-            alerts = build_alerts(full_result_df)
-
-            threat_df = full_result_df[full_result_df["threat_status"] == "Threat"]
-            top_attack = (
-                threat_df["predicted_class"].value_counts().idxmax()
-                if not threat_df.empty else "normal"
-            )
-
-            return jsonify({
-                "time": time.strftime("%H:%M:%S"),
-                "mode": "real",
-                "alerts": alerts,
-                "rows": display_result_df.to_dict(orient="records"),
-                "total_logs": total_logs,
-                "total_threats": total_threats,
-                "total_safe": total_safe,
-                "top_attack": top_attack,
-                "status_message": "Demo attack simulation active" if SIMULATION_STATE["attack_mode"] else "Real packet monitoring active"
-            })
-
-        # =========================
-        # FALLBACK: UPLOADED FILE SIMULATION
-        # =========================
         file_path = LIVE_STATE.get("file_path")
 
-        if file_path and os.path.exists(file_path):
-            df = pd.read_csv(file_path, low_memory=False)
-
-            start = LIVE_STATE.get("cursor", 0)
-            chunk_size = LIVE_STATE.get("chunk_size", 20)
-            end = start + chunk_size
-
-            chunk_df = df.iloc[start:end].copy()
-
-            if chunk_df.empty:
-                LIVE_STATE["cursor"] = 0
-                start = 0
-                end = chunk_size
-                chunk_df = df.iloc[start:end].copy()
-
-            LIVE_STATE["cursor"] = end
-
-            full_result_df, display_result_df = predict_dataframe(chunk_df)
-
-            if SIMULATION_STATE["attack_mode"] and not full_result_df.empty:
-                full_result_df = full_result_df.copy()
-                display_result_df = display_result_df.copy()
-
-                full_result_df["predicted_class"] = "dos"
-                full_result_df["confidence"] = 96.45
-                full_result_df["threat_status"] = "Threat"
-
-                display_result_df["predicted_class"] = "dos"
-                display_result_df["confidence"] = 96.45
-                display_result_df["threat_status"] = "Threat"
-
-            total_logs = len(full_result_df)
-            total_threats = int((full_result_df["threat_status"] == "Threat").sum())
-            total_safe = int((full_result_df["threat_status"] == "Normal").sum())
-
-            alerts = build_alerts(full_result_df)
-
-            threat_df = full_result_df[full_result_df["threat_status"] == "Threat"]
-            top_attack = (
-                threat_df["predicted_class"].value_counts().idxmax()
-                if not threat_df.empty else "normal"
-            )
-
+        if not file_path or not os.path.exists(file_path):
             return jsonify({
                 "time": time.strftime("%H:%M:%S"),
                 "mode": "simulation",
-                "alerts": alerts,
-                "rows": display_result_df.to_dict(orient="records"),
-                "total_logs": total_logs,
-                "total_threats": total_threats,
-                "total_safe": total_safe,
-                "top_attack": top_attack,
-                "status_message": "Demo attack simulation active" if SIMULATION_STATE["attack_mode"] else "Using uploaded data (live simulation)"
+                "alerts": [],
+                "rows": [],
+                "total_logs": 0,
+                "total_threats": 0,
+                "total_safe": 0,
+                "top_attack": "No data",
+                "status_message": "Upload a dataset to use live simulation on Vercel"
             })
 
-        # =========================
-        # NO DATA
-        # =========================
+        df = pd.read_csv(file_path, low_memory=False)
+
+        start = LIVE_STATE.get("cursor", 0)
+        chunk_size = LIVE_STATE.get("chunk_size", 20)
+        end = start + chunk_size
+
+        chunk_df = df.iloc[start:end].copy()
+
+        if chunk_df.empty:
+            LIVE_STATE["cursor"] = 0
+            chunk_df = df.iloc[0:chunk_size].copy()
+            end = chunk_size
+
+        LIVE_STATE["cursor"] = end
+
+        full_result_df, display_result_df = predict_dataframe(chunk_df)
+
+        if SIMULATION_STATE["attack_mode"] and not full_result_df.empty:
+            full_result_df = full_result_df.copy()
+            display_result_df = display_result_df.copy()
+
+            full_result_df["predicted_class"] = "dos"
+            full_result_df["confidence"] = 96.45
+            full_result_df["threat_status"] = "Threat"
+
+            display_result_df["predicted_class"] = "dos"
+            display_result_df["confidence"] = 96.45
+            display_result_df["threat_status"] = "Threat"
+
+        total_logs = len(full_result_df)
+        total_threats = int((full_result_df["threat_status"] == "Threat").sum())
+        total_safe = int((full_result_df["threat_status"] == "Normal").sum())
+
+        alerts = build_alerts(full_result_df)
+
+        threat_df = full_result_df[full_result_df["threat_status"] == "Threat"]
+        top_attack = threat_df["predicted_class"].value_counts().idxmax() if not threat_df.empty else "normal"
+
         return jsonify({
             "time": time.strftime("%H:%M:%S"),
-            "mode": "none",
-            "alerts": [],
-            "rows": [],
-            "total_logs": 0,
-            "total_threats": 0,
-            "total_safe": 0,
-            "top_attack": "No data",
-            "status_message": "No packets and no uploaded file available"
+            "mode": "simulation",
+            "alerts": alerts,
+            "rows": display_result_df.to_dict(orient="records"),
+            "total_logs": total_logs,
+            "total_threats": total_threats,
+            "total_safe": total_safe,
+            "top_attack": top_attack,
+            "status_message": "Demo attack simulation active" if SIMULATION_STATE["attack_mode"] else "Using uploaded data (live simulation)"
         })
 
     except Exception as e:
